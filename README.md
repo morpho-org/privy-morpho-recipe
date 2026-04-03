@@ -9,7 +9,8 @@ A developer recipe for building **Earn** and **Borrow** products using [Privy](h
 This is an **educational demonstration** showcasing integration patterns between Privy and Morpho. It is functional but intended for learning purposes. **Do not use in production without security audits, testing, and risk assessment.**
 
 - Always exercise caution when interacting with real smart contracts and funds
-- Test on testnets before mainnet deployment
+- Always use minimal amounts
+- Never Hardcode any private keys 
 - Consider professional security audits for production applications
 
 ## Overview
@@ -36,7 +37,6 @@ Browse top 50 markets, supply collateral, borrow assets. Full position simulatio
 
 - Privy wallet authentication (social login, email, or external wallet)
 - Multi-vault and multi-market support via Morpho's GraphQL API
-- Batch transactions (approve + supply + borrow in one flow)
 - Real-time position simulation with before/after projections
 - Input validation with clear disabled reasons
 - Review step before wallet execution
@@ -131,6 +131,7 @@ The app already supports multiple chains. To add a new Morpho deployment:
 
 - **Gas Sponsorship** — Privy paymaster integration for gasless transactions
 - **Health Monitoring** — Server-side position monitoring with Privy server wallets
+- **Batch** - Using smart wallet and batching transactions
 
 ## Security Considerations
 
