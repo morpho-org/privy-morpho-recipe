@@ -1,16 +1,17 @@
 'use client';
 
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
-import { encodeFunctionData } from 'viem';
+import { MarketParams } from '@morpho-org/blue-sdk';
+import type { RequirementSignature, Transaction } from '@morpho-org/morpho-sdk';
+import { useWalletClient } from 'wagmi';
+import { base } from 'viem/chains';
 
 import {
   MORPHO_CORE_ADDRESS,
   ERC20_ABI,
   MORPHO_CORE_ABI,
   MORPHO_ORACLE_ABI,
-  REPAY_APPROVAL_BUFFER_BPS,
   BORROW_SAFETY_BUFFER,
-  BORROW_SAFETY_DIVISOR,
 } from '@/lib/constants';
 
 import {
@@ -39,6 +40,13 @@ import { usePublicClient } from '@/hooks/usePublicClient';
 import { useTxLifecycle } from '@/hooks/useTxLifecycle';
 import { useChain } from '@/context/ChainContext';
 import { withRetry } from '@/lib/retry';
+import {
+  createMorphoClient,
+  getWalletClientAddress,
+  type MorphoRequirement,
+  resolveRequirements,
+  sendBuiltTx,
+} from '@/lib/morphoSdk';
 
 export interface TxStep {
   label: string;
@@ -67,7 +75,8 @@ interface MarketInfo {
 }
 
 export function useMarketPosition(market: MarketInfo) {
-  const { sendBatchTransaction, sendSingleTransaction, isReady, address } = useSmartAccount();
+  const { isReady, address } = useSmartAccount();
+  const { data: walletClient } = useWalletClient();
   const publicClient = usePublicClient();
   const { selectedChain } = useChain();
 
@@ -344,7 +353,7 @@ export function useMarketPosition(market: MarketInfo) {
       console.error(error);
       if (!silent) setStatus('Failed to fetch balances.', 'error');
     }
-  }, [address, loanToken, collateralToken, publicClient, collateralSymbol, loanSymbol, collateralDecimals, loanDecimals]);
+  }, [address, loanToken, collateralToken, publicClient, collateralSymbol, loanSymbol, collateralDecimals, loanDecimals, setStatus]);
 
   const fetchPosition = useCallback(async (silent = false) => {
     if (!address || !marketId || !marketParamsArg || !oracleAddress) return;
@@ -406,7 +415,7 @@ export function useMarketPosition(market: MarketInfo) {
       // Preserve existing position data on error — don't zero out
       if (!silent) setStatus('Failed to fetch position. Retrying...', 'error');
     }
-  }, [address, marketId, marketParamsArg, oracleAddress, publicClient, marketLltv, collateralDecimals, collateralSymbol]);
+  }, [address, marketId, marketParamsArg, oracleAddress, publicClient, marketLltv, collateralDecimals, collateralSymbol, setStatus]);
 
   // Keep refs current so the effect doesn't re-fire on callback identity changes
   const fetchBalancesRef = useRef(fetchBalances);
@@ -425,6 +434,32 @@ export function useMarketPosition(market: MarketInfo) {
   }, [address, isReady, selectedMarketKey, loanToken, collateralToken]);
 
   // --- Transaction handlers (internal) ---
+
+  const getSdkMarket = useCallback(() => {
+    if (!walletClient) throw new Error('Wallet not connected');
+    if (!marketParamsArg) throw new Error('Market parameters are missing.');
+    if (selectedChain.id !== base.id) throw new Error('Morpho SDK actions are enabled on Base only.');
+
+    const userAddress = getWalletClientAddress(walletClient);
+    const marketParams = new MarketParams(marketParamsArg);
+
+    return {
+      userAddress,
+      sdkMarket: createMorphoClient(walletClient).marketV1(marketParams, base.id),
+    };
+  }, [marketParamsArg, selectedChain.id, walletClient]);
+
+  const sendSdkAction = useCallback(async (
+    buildTx: (requirementSignature?: RequirementSignature) => Readonly<Transaction>,
+    getRequirements?: () => Promise<readonly MorphoRequirement[]>,
+  ) => {
+    if (!walletClient) throw new Error('Wallet not connected');
+    const userAddress = getWalletClientAddress(walletClient);
+    const requirementSignature = getRequirements
+      ? await resolveRequirements(await getRequirements(), walletClient, publicClient, userAddress, selectedChain)
+      : undefined;
+    return sendBuiltTx(walletClient, buildTx(requirementSignature), selectedChain);
+  }, [publicClient, selectedChain, walletClient]);
 
   const handleSupplyAndBorrow = async () => {
     if (!address || !marketParamsArg || !collateralToken) return;
@@ -455,29 +490,17 @@ export function useMarketPosition(market: MarketInfo) {
       async ({ setTxHash, setStatus }) => {
         const collAmount = parseTokenAmount(collateralAmount, collateralDecimals);
         const borrAmount = parseTokenAmount(borrowAmount, loanDecimals);
-
-        const calls: { to: `0x${string}`; data: `0x${string}` }[] = [];
-
-        // Only approve if needed
-        if (collateralAllowance === null || collAmount > collateralAllowance) {
-          calls.push({
-            to: collateralToken,
-            data: encodeFunctionData({ abi: ERC20_ABI, functionName: 'approve', args: [MORPHO_CORE_ADDRESS, collAmount] }),
-          });
-        }
-
-        calls.push({
-          to: MORPHO_CORE_ADDRESS,
-          data: encodeFunctionData({ abi: MORPHO_CORE_ABI, functionName: 'supplyCollateral', args: [marketParamsArg, collAmount, address as `0x${string}`, '0x'] }),
+        const { userAddress, sdkMarket } = getSdkMarket();
+        const positionData = await sdkMarket.getPositionData(userAddress);
+        const action = sdkMarket.supplyCollateralBorrow({
+          amount: collAmount,
+          borrowAmount: borrAmount,
+          userAddress,
+          positionData,
         });
-
-        calls.push({
-          to: MORPHO_CORE_ADDRESS,
-          data: encodeFunctionData({ abi: MORPHO_CORE_ABI, functionName: 'borrow', args: [marketParamsArg, borrAmount, 0n, address as `0x${string}`, address as `0x${string}`] }),
-        });
-
-        const { hash } = await sendBatchTransaction(calls);
+        const hash = await sendSdkAction(action.buildTx, action.getRequirements);
         setTxHash(hash);
+        await publicClient.waitForTransactionReceipt({ hash });
         setStatus('Supply & Borrow successful!');
         await Promise.all([fetchBalances(true), fetchPosition(true)]);
       },
@@ -494,22 +517,11 @@ export function useMarketPosition(market: MarketInfo) {
       { start: 'Supplying collateral (approve + supply)...', error: 'Collateral supply failed. Please try again.' },
       async ({ setTxHash, setStatus }) => {
         const amount = parseTokenAmount(collateralAmount, collateralDecimals);
-        const calls: { to: `0x${string}`; data: `0x${string}` }[] = [];
-
-        if (collateralAllowance === null || amount > collateralAllowance) {
-          calls.push({
-            to: collateralToken,
-            data: encodeFunctionData({ abi: ERC20_ABI, functionName: 'approve', args: [MORPHO_CORE_ADDRESS, amount] }),
-          });
-        }
-
-        calls.push({
-          to: MORPHO_CORE_ADDRESS,
-          data: encodeFunctionData({ abi: MORPHO_CORE_ABI, functionName: 'supplyCollateral', args: [marketParamsArg, amount, address as `0x${string}`, '0x'] }),
-        });
-
-        const { hash } = await sendBatchTransaction(calls);
+        const { userAddress, sdkMarket } = getSdkMarket();
+        const action = sdkMarket.supplyCollateral({ amount, userAddress });
+        const hash = await sendSdkAction(action.buildTx, action.getRequirements);
         setTxHash(hash);
+        await publicClient.waitForTransactionReceipt({ hash });
         setStatus(`${collateralSymbol} collateral supplied successfully!`);
         await Promise.all([fetchBalances(true), fetchPosition(true)]);
       },
@@ -536,11 +548,12 @@ export function useMarketPosition(market: MarketInfo) {
       { start: `Borrowing ${loanSymbol}...`, error: 'Borrow failed. Please try again.' },
       async ({ setTxHash, setStatus }) => {
         const amount = parseTokenAmount(borrowAmount, loanDecimals);
-        const hash = await sendSingleTransaction({
-          to: MORPHO_CORE_ADDRESS,
-          data: encodeFunctionData({ abi: MORPHO_CORE_ABI, functionName: 'borrow', args: [marketParamsArg, amount, 0n, address as `0x${string}`, address as `0x${string}`] }),
-        });
+        const { userAddress, sdkMarket } = getSdkMarket();
+        const positionData = await sdkMarket.getPositionData(userAddress);
+        const action = sdkMarket.borrow({ amount, userAddress, positionData });
+        const hash = await sendSdkAction(action.buildTx, action.getRequirements);
         setTxHash(hash);
+        await publicClient.waitForTransactionReceipt({ hash });
         setStatus(`${loanSymbol} borrowed successfully!`);
         await Promise.all([fetchBalances(true), fetchPosition(true)]);
       },
@@ -571,22 +584,19 @@ export function useMarketPosition(market: MarketInfo) {
       { start: 'Repaying (approve + repay)...', error: 'Repay failed. Please try again.' },
       async ({ setTxHash, setStatus }) => {
         const amount = parseTokenAmount(repayAmount, loanDecimals);
-        const calls: { to: `0x${string}`; data: `0x${string}` }[] = [];
-
-        if (loanAllowance === null || amount > loanAllowance) {
-          calls.push({
-            to: loanToken,
-            data: encodeFunctionData({ abi: ERC20_ABI, functionName: 'approve', args: [MORPHO_CORE_ADDRESS, amount] }),
-          });
+        const { userAddress, sdkMarket } = getSdkMarket();
+        const positionData = await sdkMarket.getPositionData(userAddress);
+        const repayAmountArgs = amount >= positionData.borrowAssets
+          ? { shares: positionData.borrowShares }
+          : { assets: amount };
+        if ('shares' in repayAmountArgs && repayAmountArgs.shares === 0n) {
+          setStatus('No debt to repay.');
+          return;
         }
-
-        calls.push({
-          to: MORPHO_CORE_ADDRESS,
-          data: encodeFunctionData({ abi: MORPHO_CORE_ABI, functionName: 'repay', args: [marketParamsArg, amount, 0n, address as `0x${string}`, '0x'] }),
-        });
-
-        const { hash } = await sendBatchTransaction(calls);
+        const action = sdkMarket.repay({ ...repayAmountArgs, userAddress, positionData });
+        const hash = await sendSdkAction(action.buildTx, action.getRequirements);
         setTxHash(hash);
+        await publicClient.waitForTransactionReceipt({ hash });
         setStatus(`${loanSymbol} repaid successfully!`);
         await Promise.all([fetchBalances(true), fetchPosition(true)]);
       },
@@ -599,37 +609,21 @@ export function useMarketPosition(market: MarketInfo) {
     await executeTx(
       { start: 'Repaying all debt (shares-based)...', error: 'Repay All failed. Please try again.' },
       async ({ setTxHash, setStatus }) => {
-        const [freshPosition, freshMarketData] = await Promise.all([
-          publicClient.readContract({
-            address: MORPHO_CORE_ADDRESS,
-            abi: MORPHO_CORE_ABI,
-            functionName: 'position',
-            args: [marketId, address as `0x${string}`],
-          }),
-          publicClient.readContract({
-            address: MORPHO_CORE_ADDRESS,
-            abi: MORPHO_CORE_ABI,
-            functionName: 'market',
-            args: [marketId],
-          }),
-        ]);
-
-        const [, freshBorrowShares] = freshPosition as [bigint, bigint, bigint];
-        if (freshBorrowShares === 0n) {
+        const { userAddress, sdkMarket } = getSdkMarket();
+        const positionData = await sdkMarket.getPositionData(userAddress);
+        if (positionData.borrowShares === 0n) {
           setStatus('No debt to repay.');
           return;
         }
 
-        const [, , totalBorrowAssets, totalBorrowShares] = freshMarketData as [bigint, bigint, bigint, bigint, bigint, bigint];
-        const expectedRepay = toAssetsUp(freshBorrowShares, totalBorrowAssets, totalBorrowShares);
-        const approvalAmount = expectedRepay * (10000n + REPAY_APPROVAL_BUFFER_BPS) / 10000n;
-
-        const { hash } = await sendBatchTransaction([
-          { to: loanToken, data: encodeFunctionData({ abi: ERC20_ABI, functionName: 'approve', args: [MORPHO_CORE_ADDRESS, approvalAmount] }) },
-          { to: MORPHO_CORE_ADDRESS, data: encodeFunctionData({ abi: MORPHO_CORE_ABI, functionName: 'repay', args: [marketParamsArg, 0n, freshBorrowShares, address as `0x${string}`, '0x'] }) },
-        ]);
-
+        const action = sdkMarket.repay({
+          shares: positionData.borrowShares,
+          userAddress,
+          positionData,
+        });
+        const hash = await sendSdkAction(action.buildTx, action.getRequirements);
         setTxHash(hash);
+        await publicClient.waitForTransactionReceipt({ hash });
         setStatus('All debt repaid successfully!');
         await Promise.all([fetchBalances(true), fetchPosition(true)]);
       },
@@ -646,11 +640,12 @@ export function useMarketPosition(market: MarketInfo) {
       { start: `Withdrawing ${collateralSymbol} collateral...`, error: 'Collateral withdrawal failed. Please try again.' },
       async ({ setTxHash, setStatus }) => {
         const amount = parseTokenAmount(withdrawAmount, collateralDecimals);
-        const hash = await sendSingleTransaction({
-          to: MORPHO_CORE_ADDRESS,
-          data: encodeFunctionData({ abi: MORPHO_CORE_ABI, functionName: 'withdrawCollateral', args: [marketParamsArg, amount, address as `0x${string}`, address as `0x${string}`] }),
-        });
+        const { userAddress, sdkMarket } = getSdkMarket();
+        const positionData = await sdkMarket.getPositionData(userAddress);
+        const tx = sdkMarket.withdrawCollateral({ amount, userAddress, positionData }).buildTx();
+        const hash = await sendSdkAction(() => tx);
         setTxHash(hash);
+        await publicClient.waitForTransactionReceipt({ hash });
         setStatus(`${withdrawAmount} ${collateralSymbol} collateral withdrawn successfully!`);
         await Promise.all([fetchBalances(true), fetchPosition(true)]);
       },
@@ -663,11 +658,16 @@ export function useMarketPosition(market: MarketInfo) {
     await executeTx(
       { start: `Withdrawing all ${collateralSymbol} collateral...`, error: 'Collateral withdrawal failed. Please try again.' },
       async ({ setTxHash, setStatus }) => {
-        const hash = await sendSingleTransaction({
-          to: MORPHO_CORE_ADDRESS,
-          data: encodeFunctionData({ abi: MORPHO_CORE_ABI, functionName: 'withdrawCollateral', args: [marketParamsArg, position!.collateral, address as `0x${string}`, address as `0x${string}`] }),
-        });
+        const { userAddress, sdkMarket } = getSdkMarket();
+        const positionData = await sdkMarket.getPositionData(userAddress);
+        const tx = sdkMarket.withdrawCollateral({
+          amount: positionData.collateral,
+          userAddress,
+          positionData,
+        }).buildTx();
+        const hash = await sendSdkAction(() => tx);
         setTxHash(hash);
+        await publicClient.waitForTransactionReceipt({ hash });
         setStatus(`All ${collateralSymbol} collateral withdrawn successfully!`);
         setPosition(null);
         setHealthFactor(null);
@@ -677,25 +677,57 @@ export function useMarketPosition(market: MarketInfo) {
     );
   };
 
+  const handleRepayAndWithdrawCollateral = async () => {
+    if (!address || !marketParamsArg || !loanToken) return;
+
+    const repayValidationError = validateAmount(repayAmount, loanDecimals, loanBalance ?? undefined);
+    if (repayValidationError) { setStatus(repayValidationError, 'error'); return; }
+
+    const withdrawValidationError = validateAmount(withdrawAmount, collateralDecimals);
+    if (withdrawValidationError) { setStatus(withdrawValidationError, 'error'); return; }
+
+    await executeTx(
+      { start: 'Repaying and withdrawing collateral...', error: 'Repay & Withdraw failed. Please try again.' },
+      async ({ setTxHash, setStatus }) => {
+        const repayAssets = parseTokenAmount(repayAmount, loanDecimals);
+        const withdrawParsed = parseTokenAmount(withdrawAmount, collateralDecimals);
+        const { userAddress, sdkMarket } = getSdkMarket();
+        const positionData = await sdkMarket.getPositionData(userAddress);
+        const repayAmountArgs = repayAssets >= positionData.borrowAssets
+          ? { shares: positionData.borrowShares }
+          : { assets: repayAssets };
+        if ('shares' in repayAmountArgs && repayAmountArgs.shares === 0n) {
+          setStatus('No debt to repay.');
+          return;
+        }
+
+        const action = sdkMarket.repayWithdrawCollateral({
+          ...repayAmountArgs,
+          withdrawAmount: withdrawParsed,
+          userAddress,
+          positionData,
+        });
+        const hash = await sendSdkAction(action.buildTx, action.getRequirements);
+        setTxHash(hash);
+        await publicClient.waitForTransactionReceipt({ hash });
+        setStatus('Repay & Withdraw successful!');
+        await Promise.all([fetchBalances(true), fetchPosition(true)]);
+      },
+    );
+  };
+
   // Single execute for repay tab — dispatches based on inputs
   const handleRepayExecute = async () => {
     const hasRepay = repayAmount && parseFloat(repayAmount) > 0;
     const hasWithdraw = withdrawAmount && parseFloat(withdrawAmount) > 0;
 
-    // Check if repay amount equals full debt → use share-based repayAll
-    if (hasRepay && currentDebtAssets > 0n) {
-      try {
-        const repayParsed = parseTokenAmount(repayAmount, loanDecimals);
-        if (repayParsed >= currentDebtAssets) {
-          await handleRepayAll();
-          if (hasWithdraw) await handleWithdrawCollateral();
-          return;
-        }
-      } catch { /* proceed with normal repay */ }
+    if (hasRepay && hasWithdraw) {
+      await handleRepayAndWithdrawCollateral();
+    } else if (hasRepay) {
+      await handleRepay();
+    } else if (hasWithdraw) {
+      await handleWithdrawCollateral();
     }
-
-    if (hasRepay) await handleRepay();
-    if (hasWithdraw) await handleWithdrawCollateral();
   };
 
   return {

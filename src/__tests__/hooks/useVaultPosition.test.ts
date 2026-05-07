@@ -6,6 +6,42 @@ const mockSendBatchTransaction = vi.fn();
 const mockSendSingleTransaction = vi.fn();
 const mockReadContract = vi.fn();
 const mockWaitForTransactionReceipt = vi.fn().mockResolvedValue({ status: 'success' });
+const morphoMocks = vi.hoisted(() => {
+  const mockWalletClient = {
+    account: { address: '0x1234567890abcdef1234567890abcdef12345678' as const },
+    sendTransaction: vi.fn(),
+  };
+  const mockSdkTx = {
+    to: '0x9999999999999999999999999999999999999999' as `0x${string}`,
+    data: '0x' as `0x${string}`,
+    value: 0n,
+  };
+  const mockDepositAction = {
+    getRequirements: vi.fn().mockResolvedValue([]),
+    buildTx: vi.fn().mockReturnValue(mockSdkTx),
+  };
+  return {
+    mockWalletClient,
+    mockSdkTx,
+    mockDepositAction,
+    mockVaultEntity: {
+      getData: vi.fn().mockResolvedValue({ address: '0x1111111111111111111111111111111111111111' }),
+      deposit: vi.fn().mockReturnValue(mockDepositAction),
+      redeem: vi.fn().mockReturnValue({ buildTx: vi.fn().mockReturnValue(mockSdkTx) }),
+      withdraw: vi.fn().mockReturnValue({ buildTx: vi.fn().mockReturnValue(mockSdkTx) }),
+    },
+    mockSendBuiltTx: vi.fn().mockResolvedValue('0xsdkhash'),
+    mockResolveRequirements: vi.fn().mockResolvedValue(undefined),
+  };
+});
+const {
+  mockWalletClient,
+  mockSdkTx,
+  mockDepositAction,
+  mockVaultEntity,
+  mockSendBuiltTx,
+  mockResolveRequirements,
+} = morphoMocks;
 
 vi.mock('@/context/ChainContext', () => ({
   useChain: vi.fn(() => ({
@@ -17,6 +53,10 @@ vi.mock('@/context/ChainContext', () => ({
   })),
 }));
 
+vi.mock('wagmi', () => ({
+  useWalletClient: vi.fn(() => ({ data: morphoMocks.mockWalletClient })),
+}));
+
 vi.mock('@/hooks/useSmartAccount', () => ({
   useSmartAccount: vi.fn(() => ({
     sendBatchTransaction: mockSendBatchTransaction,
@@ -24,6 +64,15 @@ vi.mock('@/hooks/useSmartAccount', () => ({
     address: '0x1234567890abcdef1234567890abcdef12345678',
     isReady: true,
   })),
+}));
+
+vi.mock('@/lib/morphoSdk', () => ({
+  createMorphoClient: vi.fn(() => ({
+    vaultV2: vi.fn(() => morphoMocks.mockVaultEntity),
+  })),
+  getWalletClientAddress: vi.fn(() => morphoMocks.mockWalletClient.account.address),
+  resolveRequirements: morphoMocks.mockResolveRequirements,
+  sendBuiltTx: morphoMocks.mockSendBuiltTx,
 }));
 
 vi.mock('@/hooks/usePublicClient', () => ({
@@ -45,6 +94,10 @@ const defaultVaultInfo = {
 describe('useVaultPosition', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockSendBuiltTx.mockResolvedValue('0xsdkhash');
+    mockResolveRequirements.mockResolvedValue(undefined);
+    mockDepositAction.getRequirements.mockResolvedValue([]);
+    mockDepositAction.buildTx.mockReturnValue(mockSdkTx);
     mockReadContract.mockResolvedValue(0n);
   });
 
@@ -104,9 +157,14 @@ describe('useVaultPosition', () => {
     expect(result.current.status).toContain('enter an amount');
   });
 
-  it('handleDeposit calls sendBatchTransaction on valid amount', async () => {
-    mockReadContract.mockResolvedValue(10_000_000n);
-    mockSendBatchTransaction.mockResolvedValue({ hash: '0xdeposithash', wasBatched: false });
+  it('handleDeposit sends SDK-built transaction on valid amount', async () => {
+    mockReadContract
+      .mockResolvedValueOnce(10_000_000n) // initial asset balance
+      .mockResolvedValueOnce(0n) // initial vault shares
+      .mockResolvedValueOnce(10n ** 10n) // dead address check
+      .mockResolvedValueOnce(1n * 10n ** 18n) // post-deposit vault shares
+      .mockResolvedValueOnce(9_000_000n) // post-deposit asset balance
+      .mockResolvedValueOnce(1_000_000n); // post-deposit vault assets
 
     const { result } = renderHook(() => useVaultPosition(defaultVaultInfo));
 
@@ -120,20 +178,22 @@ describe('useVaultPosition', () => {
       await result.current.handleDeposit();
     });
 
-    expect(mockSendBatchTransaction).toHaveBeenCalledWith(
-      expect.arrayContaining([
-        expect.objectContaining({ to: defaultVaultInfo.assetAddress }),
-      ]),
-    );
+    expect(mockVaultEntity.deposit).toHaveBeenCalled();
+    expect(mockResolveRequirements).toHaveBeenCalled();
+    expect(mockSendBuiltTx).toHaveBeenCalledWith(mockWalletClient, mockSdkTx, expect.objectContaining({ id: 8453 }));
+    expect(result.current.positionAssets).toBe(1_000_000n);
+    expect(result.current.status).toContain('Your position is now $1.00');
   });
 
-  it('handleWithdrawAll calls sendSingleTransaction', async () => {
+  it('handleWithdrawAll sends SDK-built transaction', async () => {
     mockReadContract
       .mockResolvedValueOnce(1_000_000n) // asset balance
       .mockResolvedValueOnce(5n * 10n ** 18n) // vault shares = 5 shares
       .mockResolvedValueOnce(10n ** 10n) // dead address check
+      .mockResolvedValueOnce(5_250_000n) // vault assets
+      .mockResolvedValueOnce(0n) // shares after withdrawal
+      .mockResolvedValueOnce(6_250_000n) // asset balance after withdrawal
       .mockResolvedValue(0n); // subsequent calls
-    mockSendSingleTransaction.mockResolvedValue('0xwithdrawhash');
 
     const { result } = renderHook(() => useVaultPosition(defaultVaultInfo));
 
@@ -145,7 +205,8 @@ describe('useVaultPosition', () => {
       await result.current.handleWithdrawAll();
     });
 
-    expect(mockSendSingleTransaction).toHaveBeenCalled();
+    expect(mockVaultEntity.redeem).toHaveBeenCalled();
+    expect(mockSendBuiltTx).toHaveBeenCalled();
   });
 
   it('handleWithdrawAmount validates input', async () => {

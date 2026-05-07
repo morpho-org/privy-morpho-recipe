@@ -1,7 +1,8 @@
 'use client';
 
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { encodeFunctionData } from 'viem';
+import { useWalletClient } from 'wagmi';
+import { base } from 'viem/chains';
 
 import {
   ERC20_ABI,
@@ -10,6 +11,7 @@ import {
 
 import {
   parseTokenAmount,
+  formatTokenAmount,
   formatVaultShares,
   isZero,
   validateAmount,
@@ -19,16 +21,27 @@ import { useSmartAccount } from '@/hooks/useSmartAccount';
 import { usePublicClient } from '@/hooks/usePublicClient';
 import { useTxLifecycle } from '@/hooks/useTxLifecycle';
 import { useChain } from '@/context/ChainContext';
+import { withRetry } from '@/lib/retry';
+import {
+  createMorphoClient,
+  getWalletClientAddress,
+  resolveRequirements,
+  sendBuiltTx,
+} from '@/lib/morphoSdk';
 
 const DEAD_ADDRESS = '0x000000000000000000000000000000000000dEaD' as const;
 
-function formatPositionUsd(sharesAmount: bigint, sharePriceUsd: number | null): string | null {
-  if (!sharePriceUsd) return null;
-  const sharesFloat = parseFloat(formatVaultShares(sharesAmount));
-  return (sharesFloat * sharePriceUsd).toFixed(2);
+function formatPositionUsd(assetsAmount: bigint, assetDecimals: number, assetPriceUsd: number | null): string | null {
+  if (!assetPriceUsd) return null;
+  const assetsFloat = parseFloat(formatTokenAmount(assetsAmount, assetDecimals));
+  return (assetsFloat * assetPriceUsd).toFixed(2);
 }
 const VAULT_SAFETY_THRESHOLD = 10n ** 9n;
-const LARGE_SLIPPAGE_BPS = 500n; // 5% — only warn if discrepancy exceeds this
+
+interface VaultPositionSnapshot {
+  shares: bigint;
+  assets: bigint;
+}
 
 interface VaultInfo {
   selectedVaultAddress: string;
@@ -40,7 +53,8 @@ interface VaultInfo {
 }
 
 export function useVaultPosition(vault: VaultInfo) {
-  const { sendBatchTransaction, sendSingleTransaction, address } = useSmartAccount();
+  const { address } = useSmartAccount();
+  const { data: walletClient } = useWalletClient();
   const publicClient = usePublicClient();
   const { selectedChain } = useChain();
 
@@ -60,17 +74,19 @@ export function useVaultPosition(vault: VaultInfo) {
   const [depositAmount, setDepositAmount] = useState('');
   const [withdrawAmount, setWithdrawAmount] = useState('');
   const [shares, setShares] = useState<bigint | null>(null);
+  const [positionAssets, setPositionAssets] = useState<bigint | null>(null);
   const [assetBalance, setAssetBalance] = useState<bigint | null>(null);
   const [vaultSafetyWarning, setVaultSafetyWarning] = useState<string | null>(null);
 
-  const maxWithdrawUsd = (shares !== null && shares > 0n && sharePriceUsd)
-    ? parseFloat(formatVaultShares(shares)) * sharePriceUsd
+  const maxWithdrawUsd = (positionAssets !== null && assetPriceUsd)
+    ? parseFloat(formatTokenAmount(positionAssets, assetDecimals)) * assetPriceUsd
     : null;
 
   // Reset state when vault or chain changes
   const withdrawDefaultSet = useRef(false);
   useEffect(() => {
     setShares(null);
+    setPositionAssets(null);
     setAssetBalance(null);
     setWithdrawAmount('');
     resetTxState();
@@ -125,34 +141,74 @@ export function useVaultPosition(vault: VaultInfo) {
     }
   }, [address, assetAddress, publicClient]);
 
-  const fetchShares = useCallback(async () => {
-    if (!address || !selectedVaultAddress) return;
-    try {
-      const balance = await publicClient.readContract({
-        address: selectedVaultAddress as `0x${string}`,
-        abi: MORPHO_VAULT_ABI,
-        functionName: 'balanceOf',
-        args: [address as `0x${string}`],
-      });
-      setShares(balance as bigint);
-    } catch (error) {
-      console.error('Failed to fetch vault shares:', error);
+  const readVaultPositionSnapshot = useCallback(async (
+    vaultAddr: `0x${string}`,
+    userAddress: `0x${string}`,
+    blockNumber?: bigint,
+  ): Promise<VaultPositionSnapshot> => {
+    const readOptions = blockNumber ? { blockNumber } : {};
+    const shareBalance = await publicClient.readContract({
+      address: vaultAddr,
+      abi: MORPHO_VAULT_ABI,
+      functionName: 'balanceOf',
+      args: [userAddress],
+      ...readOptions,
+    }) as bigint;
+
+    if (shareBalance === 0n) {
+      return { shares: 0n, assets: 0n };
     }
-  }, [address, selectedVaultAddress, publicClient]);
+
+    const assets = await publicClient.readContract({
+      address: vaultAddr,
+      abi: MORPHO_VAULT_ABI,
+      functionName: 'convertToAssets',
+      args: [shareBalance],
+      ...readOptions,
+    }) as bigint;
+
+    return { shares: shareBalance, assets };
+  }, [publicClient]);
+
+  const fetchPositionSnapshot = useCallback(async (
+    blockNumber?: bigint,
+    isFresh?: (snapshot: VaultPositionSnapshot) => boolean,
+  ) => {
+    if (!address || !selectedVaultAddress) return null;
+    const vaultAddr = selectedVaultAddress as `0x${string}`;
+    const userAddress = address as `0x${string}`;
+
+    try {
+      const snapshot = await withRetry(async () => {
+        const nextSnapshot = await readVaultPositionSnapshot(vaultAddr, userAddress, blockNumber);
+        if (isFresh && !isFresh(nextSnapshot)) {
+          throw new Error('Vault position snapshot has not caught up to the transaction yet.');
+        }
+        return nextSnapshot;
+      }, 6, 350);
+
+      setShares(snapshot.shares);
+      setPositionAssets(snapshot.assets);
+      return snapshot;
+    } catch (error) {
+      console.error('Failed to fetch vault position:', error);
+      return null;
+    }
+  }, [address, selectedVaultAddress, readVaultPositionSnapshot]);
 
   // Keep refs current so the effect doesn't re-fire on callback identity changes
   const fetchAssetBalanceRef = useRef(fetchAssetBalance);
-  const fetchSharesRef = useRef(fetchShares);
+  const fetchPositionSnapshotRef = useRef(fetchPositionSnapshot);
   const checkVaultSafetyRef = useRef(checkVaultSafety);
   useEffect(() => { fetchAssetBalanceRef.current = fetchAssetBalance; }, [fetchAssetBalance]);
-  useEffect(() => { fetchSharesRef.current = fetchShares; }, [fetchShares]);
+  useEffect(() => { fetchPositionSnapshotRef.current = fetchPositionSnapshot; }, [fetchPositionSnapshot]);
   useEffect(() => { checkVaultSafetyRef.current = checkVaultSafety; }, [checkVaultSafety]);
 
   useEffect(() => {
     if (address && selectedVaultAddress && assetAddress) {
       Promise.all([
         fetchAssetBalanceRef.current(),
-        fetchSharesRef.current(),
+        fetchPositionSnapshotRef.current(),
         checkVaultSafetyRef.current(),
       ]).catch(() => {});
     }
@@ -170,60 +226,40 @@ export function useVaultPosition(vault: VaultInfo) {
     await executeTx(
       { start: 'Depositing (approve + deposit)...', error: 'Deposit failed. Please try again.' },
       async ({ setTxHash, setStatus }) => {
+        if (!walletClient) throw new Error('Wallet not connected');
+        if (selectedChain.id !== base.id) throw new Error('Morpho SDK actions are enabled on Base only.');
+
         const amount = parseTokenAmount(depositAmount, assetDecimals);
         const vaultAddr = selectedVaultAddress as `0x${string}`;
-
-        const expectedShares = await publicClient.readContract({
-          address: vaultAddr,
-          abi: MORPHO_VAULT_ABI,
-          functionName: 'previewDeposit',
-          args: [amount],
-        }) as bigint;
-
-        const approveCalldata = encodeFunctionData({
-          abi: ERC20_ABI,
-          functionName: 'approve',
-          args: [vaultAddr, amount],
-        });
-
-        const depositCalldata = encodeFunctionData({
-          abi: MORPHO_VAULT_ABI,
-          functionName: 'deposit',
-          args: [amount, address as `0x${string}`],
-        });
-
-        const sharesBefore = shares ?? 0n;
-
-        const { hash } = await sendBatchTransaction([
-          { to: assetAddress, data: approveCalldata },
-          { to: vaultAddr, data: depositCalldata },
-        ]);
+        const userAddress = getWalletClientAddress(walletClient);
+        const previousShares = shares ?? 0n;
+        const morpho = createMorphoClient(walletClient);
+        const sdkVault = morpho.vaultV2(vaultAddr, base.id);
+        const accrualVault = await sdkVault.getData();
+        const deposit = sdkVault.deposit({ amount, userAddress, accrualVault });
+        const requirementSignature = await resolveRequirements(
+          await deposit.getRequirements(),
+          walletClient,
+          publicClient,
+          userAddress,
+          selectedChain,
+        );
+        const hash = await sendBuiltTx(walletClient, deposit.buildTx(requirementSignature), selectedChain);
 
         setTxHash(hash);
+        const receipt = await publicClient.waitForTransactionReceipt({ hash });
 
-        const [newBalance] = await Promise.all([
-          publicClient.readContract({
-            address: vaultAddr,
-            abi: MORPHO_VAULT_ABI,
-            functionName: 'balanceOf',
-            args: [address as `0x${string}`],
-          }) as Promise<bigint>,
+        const [snapshot] = await Promise.all([
+          fetchPositionSnapshot(receipt.blockNumber, (nextSnapshot) => nextSnapshot.shares > previousShares),
           fetchAssetBalance(),
         ]);
 
-        const sharesMinted = newBalance - sharesBefore;
-        const slippageThreshold = expectedShares * (10000n - LARGE_SLIPPAGE_BPS) / 10000n;
-
-        const positionUsd = formatPositionUsd(newBalance, sharePriceUsd);
+        const positionUsd = snapshot
+          ? formatPositionUsd(snapshot.assets, assetDecimals, assetPriceUsd)
+          : null;
         const positionSuffix = positionUsd ? ` Your position is now $${positionUsd}.` : '';
+        setStatus(`Deposit successful! Deposited ${depositAmount} ${assetSymbol}.${positionSuffix}`);
 
-        if (expectedShares > 0n && sharesMinted < slippageThreshold) {
-          setStatus(`Deposit successful! Deposited ${depositAmount} ${assetSymbol}.${positionSuffix} Note: received slightly fewer shares than estimated.`);
-        } else {
-          setStatus(`Deposit successful! Deposited ${depositAmount} ${assetSymbol}.${positionSuffix}`);
-        }
-
-        setShares(newBalance);
         setDepositAmount('');
       },
     );
@@ -235,25 +271,26 @@ export function useVaultPosition(vault: VaultInfo) {
     await executeTx(
       { start: 'Withdrawing all...', error: 'Full withdrawal failed. Please try again.' },
       async ({ setTxHash, setStatus }) => {
+        if (!walletClient) throw new Error('Wallet not connected');
+        if (selectedChain.id !== base.id) throw new Error('Morpho SDK actions are enabled on Base only.');
+
         const vaultAddr = selectedVaultAddress as `0x${string}`;
-
-        const redeemCalldata = encodeFunctionData({
-          abi: MORPHO_VAULT_ABI,
-          functionName: 'redeem',
-          args: [shares!, address as `0x${string}`, address as `0x${string}`],
-        });
-
-        const hash = await sendSingleTransaction({
-          to: vaultAddr,
-          data: redeemCalldata,
-        });
+        const userAddress = getWalletClientAddress(walletClient);
+        const previousShares = shares!;
+        const morpho = createMorphoClient(walletClient);
+        const tx = morpho.vaultV2(vaultAddr, base.id)
+          .redeem({ shares: shares!, userAddress })
+          .buildTx();
+        const hash = await sendBuiltTx(walletClient, tx, selectedChain);
 
         setTxHash(hash);
-        await publicClient.waitForTransactionReceipt({ hash: hash as `0x${string}` });
+        const receipt = await publicClient.waitForTransactionReceipt({ hash });
+        await Promise.all([
+          fetchPositionSnapshot(receipt.blockNumber, (nextSnapshot) => nextSnapshot.shares < previousShares),
+          fetchAssetBalance(),
+        ]);
         setStatus('Withdrawal successful! All shares redeemed.');
-        setShares(0n);
         setWithdrawAmount('');
-        await fetchAssetBalance();
       },
     );
   };
@@ -275,38 +312,34 @@ export function useVaultPosition(vault: VaultInfo) {
     await executeTx(
       { start: 'Withdrawing amount...', error: 'Partial withdrawal failed. Please try again.' },
       async ({ setTxHash, setStatus }) => {
+        if (!walletClient) throw new Error('Wallet not connected');
+        if (selectedChain.id !== base.id) throw new Error('Morpho SDK actions are enabled on Base only.');
+
         const vaultAddr = selectedVaultAddress as `0x${string}`;
+        const userAddress = getWalletClientAddress(walletClient);
+        const previousShares = shares ?? 0n;
         const tokenAmount = usdAmount / assetPriceUsd;
         const amount = parseTokenAmount(tokenAmount.toString(), assetDecimals);
 
         setStatus(`Withdrawing ~${tokenAmount.toFixed(2)} ${assetSymbol}...`);
 
-        const withdrawCalldata = encodeFunctionData({
-          abi: MORPHO_VAULT_ABI,
-          functionName: 'withdraw',
-          args: [amount, address as `0x${string}`, address as `0x${string}`],
-        });
-
-        const hash = await sendSingleTransaction({
-          to: vaultAddr,
-          data: withdrawCalldata,
-        });
+        const morpho = createMorphoClient(walletClient);
+        const tx = morpho.vaultV2(vaultAddr, base.id)
+          .withdraw({ amount, userAddress })
+          .buildTx();
+        const hash = await sendBuiltTx(walletClient, tx, selectedChain);
 
         setTxHash(hash);
-        await publicClient.waitForTransactionReceipt({ hash: hash as `0x${string}` });
+        const receipt = await publicClient.waitForTransactionReceipt({ hash });
 
-        // Read new balance directly from contract (state updates are async)
-        const newShareBalance = await publicClient.readContract({
-          address: vaultAddr,
-          abi: MORPHO_VAULT_ABI,
-          functionName: 'balanceOf',
-          args: [address as `0x${string}`],
-        }) as bigint;
+        const [snapshot] = await Promise.all([
+          fetchPositionSnapshot(receipt.blockNumber, (nextSnapshot) => nextSnapshot.shares < previousShares),
+          fetchAssetBalance(),
+        ]);
 
-        setShares(newShareBalance);
-        await fetchAssetBalance();
-
-        const positionUsd = formatPositionUsd(newShareBalance, sharePriceUsd);
+        const positionUsd = snapshot
+          ? formatPositionUsd(snapshot.assets, assetDecimals, assetPriceUsd)
+          : null;
         const positionSuffix = positionUsd ? ` Your position is now $${positionUsd}.` : '';
         setStatus(`Withdrawal of $${withdrawAmount} successful!${positionSuffix}`);
         setWithdrawAmount('');
@@ -323,6 +356,7 @@ export function useVaultPosition(vault: VaultInfo) {
     statusKind,
     txHash,
     shares,
+    positionAssets,
     assetBalance,
     isLoading,
     vaultSafetyWarning,

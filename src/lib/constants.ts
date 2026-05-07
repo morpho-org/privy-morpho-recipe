@@ -1,10 +1,10 @@
 import { parseAbi } from 'viem';
-import { blueAbi, metaMorphoAbi, blueOracleAbi } from '@morpho-org/blue-sdk-viem';
+import { blueAbi, vaultV2Abi, blueOracleAbi } from '@morpho-org/blue-sdk-viem';
 
 export const MORPHO_CORE_ADDRESS = '0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb' as const;
 
 export const MORPHO_CORE_ABI = blueAbi;
-export const MORPHO_VAULT_ABI = metaMorphoAbi;
+export const MORPHO_VAULT_ABI = vaultV2Abi;
 export const MORPHO_ORACLE_ABI = blueOracleAbi;
 
 export const ERC20_ABI = parseAbi([
