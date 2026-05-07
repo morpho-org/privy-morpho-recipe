@@ -44,7 +44,7 @@ export default function VaultOperationsModal({ vaultAddress }: VaultOperationsMo
     depositAmount, setDepositAmount,
     withdrawAmount, setWithdrawAmount,
     status, statusKind, txHash,
-    shares, assetBalance,
+    shares, positionAssets, assetBalance,
     isLoading, vaultSafetyWarning,
     maxWithdrawUsd, explorerUrl,
     handleDeposit, handleWithdrawAll, handleWithdrawAmount,
@@ -60,6 +60,9 @@ export default function VaultOperationsModal({ vaultAddress }: VaultOperationsMo
   useEffect(() => { setReviewMode(false); }, [vaultTab, selectedVaultAddress]);
 
   const vaultPositionUsd = maxWithdrawUsd !== null ? maxWithdrawUsd.toFixed(2) : null;
+  const vaultPositionAssets = positionAssets !== null
+    ? formatTokenAmount(positionAssets, assetDecimals)
+    : null;
   const walletBalanceUsd = assetBalance !== null && assetPriceUsd
     ? (parseFloat(formatTokenAmount(assetBalance, assetDecimals)) * assetPriceUsd).toFixed(2)
     : null;
@@ -78,6 +81,11 @@ export default function VaultOperationsModal({ vaultAddress }: VaultOperationsMo
   // Vault simulation
   const vaultSim = useMemo(() => {
     if (!shares || !sharePriceUsd || !assetPriceUsd) return null;
+    const hasInput = vaultTab === 'deposit'
+      ? !!depositAmount && parseFloat(depositAmount) > 0
+      : !!withdrawAmount && parseFloat(withdrawAmount) > 0;
+    if (!hasInput) return null;
+
     if (vaultTab === 'deposit') {
       const depositParsed = (() => {
         if (!depositAmount || parseFloat(depositAmount) <= 0) return 0n;
@@ -256,6 +264,13 @@ export default function VaultOperationsModal({ vaultAddress }: VaultOperationsMo
                   </div>
                 </>
               )}
+              <div className="border-t border-white/[0.05] my-1" />
+              <div className="flex justify-between items-center">
+                <span className="text-muted-foreground">Vault Assets</span>
+                <span className="font-mono font-medium text-foreground">
+                  {vaultPositionAssets !== null ? `${vaultPositionAssets} ${assetSymbol}` : '—'}
+                </span>
+              </div>
               <div className="border-t border-white/[0.05] my-1" />
               <div className="flex justify-between items-center">
                 <span className="text-muted-foreground">Wallet Balance</span>

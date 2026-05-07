@@ -19,7 +19,7 @@ This recipe demonstrates how to build a **one-click DeFi lending application** c
 
 - **[Privy](https://privy.io)** — Embedded wallet infrastructure for seamless user onboarding
 - **[Morpho](https://morpho.org)** — Hyper-efficient lending markets and vault yield optimization
-- **Multi-chain** — Supports Ethereum, Base, Arbitrum, Polygon, Optimism, and more
+- **Multi-chain discovery** — Browse Morpho deployments on Ethereum, Base, Arbitrum, Polygon, Optimism, and more, with SDK-backed transaction execution currently enabled on Base
 
 ### Earn Product
 
@@ -36,7 +36,8 @@ Browse top 50 markets, supply collateral, borrow assets. Full position simulatio
 ### Key Features
 
 - Privy wallet authentication (social login, email, or external wallet)
-- Multi-vault and multi-market support via Morpho's GraphQL API
+- Multi-vault and multi-market discovery via Morpho's GraphQL API
+- Transaction building via `@morpho-org/morpho-sdk` for vault deposits/withdrawals and market borrow/repay flows
 - Real-time position simulation with before/after projections
 - Input validation with clear disabled reasons
 - Review step before wallet execution
@@ -44,7 +45,7 @@ Browse top 50 markets, supply collateral, borrow assets. Full position simulatio
 
 ## Prerequisites
 
-- **Node.js 20+** and **yarn**
+- **Node.js 20+** and **pnpm**
 - **Privy App ID** from the [Privy Dashboard](https://dashboard.privy.io)
 - **Basic DeFi knowledge** (ERC-20 tokens, lending markets, vaults)
 
@@ -53,7 +54,7 @@ Browse top 50 markets, supply collateral, borrow assets. Full position simulatio
 ```bash
 git clone https://github.com/morpho-org/privy-morpho-recipe.git
 cd privy-morpho-recipe
-yarn install
+pnpm install
 ```
 
 Create `.env.local`:
@@ -65,7 +66,7 @@ NEXT_PUBLIC_PRIVY_APP_ID=your_privy_app_id
 Run the development server:
 
 ```bash
-yarn dev
+pnpm dev
 ```
 
 ## Architecture
@@ -98,13 +99,15 @@ Morpho GraphQL API → Apollo Client → useMarkets/useVaults hooks
                                          ↓
 User selects market/vault → useMarketPosition/useVaultPosition hooks
                                          ↓
-On-chain reads (viem) → Position, oracle price, market data
+On-chain reads (viem + Morpho SDK) → Position, oracle price, market data
                                          ↓
 Simulation engine → Projected LTV, HF, liquidation price
                                          ↓
 Validation engine → CTA state, disabled reasons
                                          ↓
-Review step → Wallet execution via Privy
+Morpho SDK action → requirements, signatures/approvals, built transaction
+                                         ↓
+Review step → Wallet execution via Privy wallet client
 ```
 
 ### Libraries
@@ -112,7 +115,9 @@ Review step → Wallet execution via Privy
 | Library | Purpose |
 |---------|---------|
 | `@privy-io/react-auth` | Wallet authentication and embedded wallets |
-| `@morpho-org/blue-sdk-viem` | Morpho contract ABIs and types |
+| `@morpho-org/morpho-sdk` | Recommended Morpho SDK for building VaultV2 and MarketV1 transactions, resolving approvals, Permit/Permit2 signatures, and Morpho authorizations |
+| `@morpho-org/blue-sdk` | Morpho market params and offchain entity types used by the SDK flow |
+| `@morpho-org/blue-sdk-viem` | Morpho contract ABIs and viem-compatible helpers |
 | `@apollo/client` | GraphQL data fetching from Morpho API |
 | `wagmi` + `viem` | Blockchain interactions and contract calls |
 | `framer-motion` | UI animations |
@@ -121,11 +126,14 @@ Review step → Wallet execution via Privy
 
 ### Adding a New Chain
 
-The app already supports multiple chains. To add a new Morpho deployment:
+The app already supports multiple chains for market and vault discovery. Current SDK-backed transaction execution is enabled on Base.
+
+To add a new Morpho deployment:
 
 1. Add the chain to `CHAIN_ID_MAP` in `src/context/ChainContext.tsx`
 2. Add the chain config to `wagmiConfig` in `src/app/providers.tsx`
 3. The GraphQL API will automatically include markets/vaults on the new chain
+4. Enable the transaction handlers for that chain after validating Morpho SDK support, RPC configuration, and wallet signing behavior
 
 ### Optional Features (Not Yet Implemented)
 
@@ -145,6 +153,8 @@ The app already supports multiple chains. To add a new Morpho deployment:
 
 - [Privy Documentation](https://docs.privy.io)
 - [Morpho Documentation](https://docs.morpho.org)
+- [Morpho SDK Documentation](https://docs.morpho.org/tools/offchain/sdks/morpho-sdk/)
+- [Morpho SDK Source](https://github.com/morpho-org/sdks/tree/main/packages/morpho-sdk)
 - [Morpho GraphQL API](https://blue-api.morpho.org/graphql)
 - [Morpho App](https://app.morpho.org)
 

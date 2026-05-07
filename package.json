@@ -2,9 +2,12 @@
   "name": "privy-earn-app",
   "version": "0.1.0",
   "private": true,
-  "resolutions": {
-    "@walletconnect/logger": "3.0.2",
-    "@walletconnect/logger/pino": "10.1.1"
+  "packageManager": "pnpm@10.23.0",
+  "pnpm": {
+    "overrides": {
+      "@walletconnect/logger": "3.0.2",
+      "pino": "10.1.1"
+    }
   },
   "scripts": {
     "dev": "next dev",
@@ -19,9 +22,10 @@
   },
   "dependencies": {
     "@apollo/client": "^4.1.6",
-    "@morpho-org/blue-sdk": "^5.19.0",
-    "@morpho-org/blue-sdk-viem": "^4.6.0",
-    "@morpho-org/morpho-ts": "^2.5.0",
+    "@morpho-org/blue-sdk": "^5.23.2",
+    "@morpho-org/blue-sdk-viem": "^4.6.5",
+    "@morpho-org/morpho-sdk": "1.2.1",
+    "@morpho-org/morpho-ts": "^2.5.1",
     "@privy-io/react-auth": "^3.17.0",
     "@privy-io/wagmi": "^4.0.2",
     "@radix-ui/react-slot": "^1.2.4",

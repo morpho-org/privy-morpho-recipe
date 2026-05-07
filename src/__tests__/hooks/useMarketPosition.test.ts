@@ -8,6 +8,49 @@ const mockSendSingleTransaction = vi.fn();
 const mockReadContract = vi.fn();
 const mockMulticall = vi.fn();
 const mockWaitForTransactionReceipt = vi.fn().mockResolvedValue({ status: 'success' });
+const morphoMocks = vi.hoisted(() => {
+  const mockWalletClient = {
+    account: { address: '0x1234567890abcdef1234567890abcdef12345678' as const },
+    sendTransaction: vi.fn(),
+  };
+  const mockSdkTx = {
+    to: '0x9999999999999999999999999999999999999999' as `0x${string}`,
+    data: '0x' as `0x${string}`,
+    value: 0n,
+  };
+  const sdkAction = () => ({
+    getRequirements: vi.fn().mockResolvedValue([]),
+    buildTx: vi.fn().mockReturnValue(mockSdkTx),
+  });
+  const mockSdkPosition = {
+    supplyShares: 0n,
+    borrowShares: 50_000n * 10n ** 6n,
+    borrowAssets: 50_000n * 10n ** 6n,
+    collateral: 1n * 10n ** 8n,
+  };
+  return {
+    mockWalletClient,
+    mockSdkTx,
+    mockSdkPosition,
+    mockSdkMarket: {
+      getPositionData: vi.fn().mockResolvedValue(mockSdkPosition),
+      supplyCollateral: vi.fn(() => sdkAction()),
+      supplyCollateralBorrow: vi.fn(() => sdkAction()),
+      borrow: vi.fn(() => sdkAction()),
+      repay: vi.fn(() => sdkAction()),
+      repayWithdrawCollateral: vi.fn(() => sdkAction()),
+      withdrawCollateral: vi.fn(() => ({ buildTx: vi.fn().mockReturnValue(mockSdkTx) })),
+    },
+    mockSendBuiltTx: vi.fn().mockResolvedValue('0xsdkhash'),
+    mockResolveRequirements: vi.fn().mockResolvedValue(undefined),
+  };
+});
+const {
+  mockSdkPosition,
+  mockSdkMarket,
+  mockSendBuiltTx,
+  mockResolveRequirements,
+} = morphoMocks;
 
 vi.mock('@/context/ChainContext', () => ({
   useChain: vi.fn(() => ({
@@ -19,6 +62,10 @@ vi.mock('@/context/ChainContext', () => ({
   })),
 }));
 
+vi.mock('wagmi', () => ({
+  useWalletClient: vi.fn(() => ({ data: morphoMocks.mockWalletClient })),
+}));
+
 vi.mock('@/hooks/useSmartAccount', () => ({
   useSmartAccount: vi.fn(() => ({
     sendBatchTransaction: mockSendBatchTransaction,
@@ -26,6 +73,15 @@ vi.mock('@/hooks/useSmartAccount', () => ({
     address: '0x1234567890abcdef1234567890abcdef12345678',
     isReady: true,
   })),
+}));
+
+vi.mock('@/lib/morphoSdk', () => ({
+  createMorphoClient: vi.fn(() => ({
+    marketV1: vi.fn(() => morphoMocks.mockSdkMarket),
+  })),
+  getWalletClientAddress: vi.fn(() => morphoMocks.mockWalletClient.account.address),
+  resolveRequirements: morphoMocks.mockResolveRequirements,
+  sendBuiltTx: morphoMocks.mockSendBuiltTx,
 }));
 
 vi.mock('@/hooks/usePublicClient', () => ({
@@ -80,6 +136,9 @@ function setupDefaultMulticall() {
 describe('useMarketPosition', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockSendBuiltTx.mockResolvedValue('0xsdkhash');
+    mockResolveRequirements.mockResolvedValue(undefined);
+    mockSdkMarket.getPositionData.mockResolvedValue(mockSdkPosition);
     mockReadContract.mockResolvedValue(0n);
     // Default multicall returns zeros — tests override as needed
     mockMulticall.mockResolvedValue(multicallResults(0n, 0n, 0n, 0n));
@@ -164,13 +223,12 @@ describe('useMarketPosition', () => {
     expect(result.current.healthFactor).toBeNull();
   });
 
-  it('handleBorrowExecute with only collateral calls sendBatchTransaction for supply', async () => {
+  it('handleBorrowExecute with only collateral sends SDK supply tx', async () => {
     mockMulticall
       .mockResolvedValueOnce(multicallResults(10n ** 8n, 10n ** 8n, 0n, 0n))
       .mockResolvedValueOnce(multicallResults([0n, 0n, 0n], [0n, 0n, 0n, 0n, 0n, 0n], 0n))
       // post-tx fetches
       .mockResolvedValue(multicallResults(0n, 0n, 0n, 0n));
-    mockSendBatchTransaction.mockResolvedValue({ hash: '0xsupplyhash', wasBatched: false });
 
     const { result } = renderHook(() => useMarketPosition(defaultMarketInfo));
     await waitFor(() => expect(mockMulticall).toHaveBeenCalled());
@@ -183,17 +241,17 @@ describe('useMarketPosition', () => {
       await result.current.handleBorrowExecute();
     });
 
-    expect(mockSendBatchTransaction).toHaveBeenCalled();
+    expect(mockSdkMarket.supplyCollateral).toHaveBeenCalled();
+    expect(mockSendBuiltTx).toHaveBeenCalled();
     expect(result.current.status).toContain('collateral supplied');
   });
 
-  it('handleBorrowExecute with both amounts calls supply & borrow', async () => {
+  it('handleBorrowExecute with both amounts uses SDK supply & borrow', async () => {
     mockMulticall
       .mockResolvedValueOnce(multicallResults(10n ** 8n, 10n ** 8n, 0n, 0n))
       .mockResolvedValueOnce(multicallResults([0n, 0n, 0n], [0n, 0n, 0n, 0n, 0n, 0n], 0n))
       // post-tx fetches
       .mockResolvedValue(multicallResults(0n, 0n, 0n, 0n));
-    mockSendBatchTransaction.mockResolvedValue({ hash: '0xbatchhash', wasBatched: true });
 
     const { result } = renderHook(() => useMarketPosition(defaultMarketInfo));
     await waitFor(() => expect(mockMulticall).toHaveBeenCalled());
@@ -207,13 +265,11 @@ describe('useMarketPosition', () => {
       await result.current.handleBorrowExecute();
     });
 
-    expect(mockSendBatchTransaction).toHaveBeenCalled();
-    // 3 calls: approve + supplyCollateral + borrow
-    expect(mockSendBatchTransaction.mock.calls[0][0]).toHaveLength(3);
+    expect(mockSdkMarket.supplyCollateralBorrow).toHaveBeenCalled();
+    expect(mockSendBuiltTx).toHaveBeenCalled();
   });
 
-  it('handleBorrowExecute with borrow only calls sendSingleTransaction', async () => {
-    mockSendSingleTransaction.mockResolvedValue('0xborrowhash');
+  it('handleBorrowExecute with borrow only uses SDK borrow', async () => {
     setupDefaultMulticall();
 
     const { result } = renderHook(() => useMarketPosition(defaultMarketInfo));
@@ -226,16 +282,16 @@ describe('useMarketPosition', () => {
       await result.current.handleBorrowExecute();
     });
 
-    expect(mockSendSingleTransaction).toHaveBeenCalled();
+    expect(mockSdkMarket.borrow).toHaveBeenCalled();
+    expect(mockSendBuiltTx).toHaveBeenCalled();
   });
 
-  it('handleRepayExecute calls sendBatchTransaction for repay', async () => {
+  it('handleRepayExecute uses SDK repay', async () => {
     mockMulticall
       .mockResolvedValueOnce(multicallResults(0n, 100_000n * 10n ** 6n, 0n, 0n))
       .mockResolvedValueOnce(multicallResults([0n, 0n, 0n], [0n, 0n, 0n, 0n, 0n, 0n], 0n))
       // post-tx fetches
       .mockResolvedValue(multicallResults(0n, 0n, 0n, 0n));
-    mockSendBatchTransaction.mockResolvedValue({ hash: '0xrepayhash', wasBatched: false });
 
     const { result } = renderHook(() => useMarketPosition({
       ...defaultMarketInfo,
@@ -248,10 +304,11 @@ describe('useMarketPosition', () => {
       await result.current.handleRepayExecute();
     });
 
-    expect(mockSendBatchTransaction).toHaveBeenCalled();
+    expect(mockSdkMarket.repay).toHaveBeenCalled();
+    expect(mockSendBuiltTx).toHaveBeenCalled();
   });
 
-  it('handleRepayAll reads fresh position and repays by shares', async () => {
+  it('handleRepayAll reads SDK position and repays by shares', async () => {
     const borrowShares = 50_000n * 10n ** 6n;
     const totalBorrowAssets = 500_000n * 10n ** 6n;
     const totalBorrowShares = 500_000n * 10n ** 6n;
@@ -268,13 +325,11 @@ describe('useMarketPosition', () => {
       // post-tx fetches
       .mockResolvedValue(multicallResults(0n, 0n, 0n, 0n));
 
-    // handleRepayAll uses readContract for fresh position and market
-    mockReadContract
-      .mockResolvedValueOnce([0n, borrowShares, 10n ** 8n]) // fresh position
-      .mockResolvedValueOnce([0n, 0n, totalBorrowAssets, totalBorrowShares, 0n, 0n]) // fresh market
-      .mockResolvedValue(0n);
-
-    mockSendBatchTransaction.mockResolvedValue({ hash: '0xrepayallhash', wasBatched: false });
+    mockSdkMarket.getPositionData.mockResolvedValueOnce({
+      ...mockSdkPosition,
+      borrowShares,
+      borrowAssets: 50_000n * 10n ** 6n,
+    });
 
     const { result } = renderHook(() => useMarketPosition({
       ...defaultMarketInfo,
@@ -286,7 +341,8 @@ describe('useMarketPosition', () => {
       await result.current.handleRepayAll();
     });
 
-    expect(mockSendBatchTransaction).toHaveBeenCalled();
+    expect(mockSdkMarket.repay).toHaveBeenCalledWith(expect.objectContaining({ shares: borrowShares }));
+    expect(mockSendBuiltTx).toHaveBeenCalled();
     expect(result.current.status).toContain('All debt repaid');
   });
 
@@ -303,9 +359,11 @@ describe('useMarketPosition', () => {
       ))
       .mockResolvedValue(multicallResults(0n, 0n, 0n, 0n));
 
-    mockReadContract
-      .mockResolvedValueOnce([0n, 0n, 10n ** 8n]) // fresh position with 0 borrowShares
-      .mockResolvedValueOnce([0n, 0n, 0n, 0n, 0n, 0n]);
+    mockSdkMarket.getPositionData.mockResolvedValueOnce({
+      ...mockSdkPosition,
+      borrowShares: 0n,
+      borrowAssets: 0n,
+    });
 
     const { result } = renderHook(() => useMarketPosition({
       ...defaultMarketInfo,
