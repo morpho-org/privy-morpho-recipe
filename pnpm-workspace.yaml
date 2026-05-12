@@ -1,1 +1,16 @@
 minimumReleaseAge: 4320
+resolutionMode: highest
+
+overrides:
+  '@walletconnect/logger': 3.0.2
+  pino: 10.1.1
+
+allowBuilds:
+  '@parcel/watcher': true
+  '@reown/appkit': false
+  bufferutil: false
+  keccak: false
+  msw: false
+  sharp: true
+  unrs-resolver: true
+  utf-8-validate: false

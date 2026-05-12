@@ -3,12 +3,6 @@
   "version": "0.1.0",
   "private": true,
   "packageManager": "pnpm@11.0.9",
-  "pnpm": {
-    "overrides": {
-      "@walletconnect/logger": "3.0.2",
-      "pino": "10.1.1"
-    }
-  },
   "scripts": {
     "dev": "next dev",
     "build": "next build",
