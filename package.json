@@ -2,13 +2,7 @@
   "name": "privy-earn-app",
   "version": "0.1.0",
   "private": true,
-  "packageManager": "pnpm@10.23.0",
-  "pnpm": {
-    "overrides": {
-      "@walletconnect/logger": "3.0.2",
-      "pino": "10.1.1"
-    }
-  },
+  "packageManager": "pnpm@11.0.9",
   "scripts": {
     "dev": "next dev",
     "build": "next build",
