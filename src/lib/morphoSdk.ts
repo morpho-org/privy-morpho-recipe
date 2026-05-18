@@ -1,10 +1,10 @@
 'use client';
 
 import {
-  MorphoClient,
   isRequirementApproval,
   isRequirementAuthorization,
   isRequirementSignature,
+  morphoViemExtension,
   type ERC20ApprovalAction,
   type MorphoAuthorizationAction,
   type Requirement,
@@ -26,10 +26,12 @@ export function getWalletClientAddress(walletClient: WalletClient): Address {
 }
 
 export function createMorphoClient(walletClient: WalletClient) {
-  return new MorphoClient(walletClient, {
-    supportSignature: true,
-    metadata: { origin: 'ori-recipe' },
-  });
+  return walletClient.extend(
+    morphoViemExtension({
+      supportSignature: true,
+      metadata: { origin: 'ori-recipe' },
+    }),
+  ).morpho;
 }
 
 export async function resolveRequirements(
