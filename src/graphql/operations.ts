@@ -63,7 +63,7 @@ export const GetMarketsQuery = graphql(`
       where: { chainId_in: [$chainId], listed: $listed, isIdle: $isIdle }
     ) {
       items {
-        uniqueKey
+        uniqueKey: marketId
         lltv
         listed
         irmAddress
