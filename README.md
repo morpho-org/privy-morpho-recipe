@@ -45,7 +45,7 @@ Browse top 50 markets, supply collateral, borrow assets. Full position simulatio
 
 ## Prerequisites
 
-- **Node.js 20+** and **pnpm**
+- **Node.js 22.13+** and **pnpm**
 - **Privy App ID** from the [Privy Dashboard](https://dashboard.privy.io)
 - **Basic DeFi knowledge** (ERC-20 tokens, lending markets, vaults)
 
